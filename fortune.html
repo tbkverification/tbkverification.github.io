@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="id">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Fortune — Verifikasi Provably-Fair</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+        body {
+            font-family: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+            padding: 18px;
+            line-height: 1.45;
+            color: #111;
+            background: #f7f9fc;
+        }
+
+        h1 {
+            margin-top: 0;
+        }
+
+        label {
+            display: block;
+            margin: 10px 0 6px;
+            font-weight: 600;
+        }
+
+        input[type="text"],
+        input[type="number"],
+        textarea {
+            width: 100%;
+            padding: 8px;
+            border-radius: 6px;
+            border: 1px solid #d0d7de;
+            box-sizing: border-box;
+            background: #fff;
+        }
+
+        button {
+            padding: 10px 14px;
+            border-radius: 8px;
+            border: 0;
+            background: #0b5fff;
+            color: white;
+            cursor: pointer;
+            font-weight: 600;
+        }
+
+        pre {
+            background: #fff;
+            padding: 12px;
+            border-radius: 8px;
+            border: 1px solid #e2e8f0;
+            overflow: auto
+        }
+
+        .row {
+            display: flex;
+            gap: 12px;
+        }
+
+        .col {
+            flex: 1;
+        }
+
+        .ok {
+            color: green;
+            font-weight: 700
+        }
+
+        .bad {
+            color: crimson;
+            font-weight: 700
+        }
+
+        table {
+            border-collapse: collapse;
+            width: 100%;
+            margin-top: 10px;
+            background: #fff;
+            border-radius: 6px;
+            overflow: hidden;
+        }
+
+        th,
+        td {
+            padding: 8px 10px;
+            border-bottom: 1px solid #eef2f7;
+            text-align: left;
+            font-size: 13px
+        }
+
+        th {
+            background: #f1f5f9;
+            font-weight: 600
+        }
+
+        footer {
+            margin-top: 18px;
+            font-size: 13px;
+            color: #555
+        }
+
+        .small {
+            font-size: 13px;
+            color: #555
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Fortune — Verifikasi Roll (Provably-Fair)</h1>
+
+    <label for="serverSeed">Server seed (plaintext HEX or text)</label>
+    <input id="serverSeed" type="text" placeholder="e.g. 9f2a... (64 hex chars) or any text" />
+
+    <label for="serverSeedHash">Server seed HASH (sha256 hex)</label>
+    <input id="serverSeedHash" type="text" placeholder="e.g. 97df320a1477a9e7..." />
+
+    <label for="clientSeed">Client seed (player)</label>
+    <input id="clientSeed" type="text" value="tester" />
+
+    <label for="nonce">Nonce (round index)</label>
+    <input id="nonce" type="number" value="0" min="0" />
+
+    <div style="margin:12px 0;">
+        <button id="verifyBtn">Verifikasi & Generate 6 dadu</button>
+    </div>
+
+    <div id="summary"></div>
+
+    <h3>Hasil Roll</h3>
+    <div id="resultArea" class="small"></div>
+
+    <h3>Detail PRF / Chunks</h3>
+    <div id="prfDetails" class="small"></div>
+
+    <h3>Tabel Multiplier</h3>
+    <table id="multTable">
+        <thead>
+            <tr>
+                <th>Range / Total</th>
+                <th>Multiplier</th>
+            </tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <footer>
+        <div>Implementasi HMAC-SHA256 + rejection sampling. Jika server seed yang Anda masukkan adalah teks (tidak hex),
+            halaman ini menganggap itu sebagai UTF-8 plaintext.</div>
+        <div style="margin-top:6px;">Limit accept = 2³² - (2³² % 6) = 4294967292 (rejection sampling untuk menghilangkan
+            modulo bias).</div>
+    </footer>
+
+    <script>
+        (async function () {
+            // Helpers
+            function isHex(str) {
+                return /^[0-9a-fA-F]+$/.test(str) && (str.length % 2 === 0);
+            }
+            function hexToBytes(hex) {
+                if (!isHex(hex)) throw new Error("Invalid hex");
+                const l = hex.length / 2;
+                const out = new Uint8Array(l);
+                for (let i = 0; i < l; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+                return out;
+            }
+            function bytesToHex(buf) {
+                return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+            }
+            function utf8ToBytes(str) {
+                return new TextEncoder().encode(str);
+            }
+
+            async function sha256Hex(bytes) {
+                const h = await crypto.subtle.digest('SHA-256', bytes);
+                return bytesToHex(h);
+            }
+
+            async function importHmacKey(rawKeyBytes) {
+                return crypto.subtle.importKey("raw", rawKeyBytes, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+            }
+
+            // HMAC-SHA256: key bytes (Uint8Array), message bytes (Uint8Array) => Promise<Uint8Array>
+            async function hmacSha256Raw(keyBytes, msgBytes) {
+                const key = await importHmacKey(keyBytes);
+                const sig = await crypto.subtle.sign("HMAC", key, msgBytes);
+                return new Uint8Array(sig);
+            }
+
+            // fair die via rejection sampling from 32-byte PRF output
+            function u32From(prfBytes, chunkIdx) {
+                // prfBytes is Uint8Array length 32
+                const start = chunkIdx * 4;
+                // big-endian
+                return (prfBytes[start] << 24) | (prfBytes[start + 1] << 16) | (prfBytes[start + 2] << 8) | (prfBytes[start + 3]);
+            }
+            const LIMIT = Math.floor(Math.pow(2, 32) / 6) * 6; // 4294967292
+
+            function fairDieFromPrf(prfBytes) {
+                // prfBytes: Uint8Array(32)
+                for (let i = 0; i < 8; i++) {
+                    // convert unsigned 32-bit
+                    let v = u32From(prfBytes, i) >>> 0; // ensure unsigned
+                    if (v < LIMIT) {
+                        return { die: (v % 6) + 1, chunkUsed: i, u32: v };
+                    }
+                }
+                return null; // caller should request new PRF (counter bump)
+            }
+
+            function getMultiplier(total) {
+                if (total === 6) return 100;
+                if (total === 7) return 50;
+                if (total === 8) return 25;
+                if (total === 9) return 12.5;
+                if (total === 10) return 7.5;
+                if (total >= 11 && total <= 12) return 5;
+                if (total >= 13 && total <= 14) return 2;
+                if (total >= 15 && total <= 16) return 1;
+                if (total >= 17 && total <= 20) return 0.5;
+                if (total >= 21 && total <= 25) return 0.5;
+                if (total >= 26 && total <= 27) return 1;
+                if (total >= 28 && total <= 29) return 2;
+                if (total >= 30 && total <= 31) return 5;
+                if (total === 32) return 7.5;
+                if (total === 33) return 12.5;
+                if (total === 34) return 25;
+                if (total === 35) return 50;
+                if (total === 36) return 100;
+                return 0;
+            }
+
+            // Fill multiplier table
+            (function fillMultTable() {
+                const tbody = document.querySelector("#multTable tbody");
+                const rows = [
+                    ["6", "100"],
+                    ["7", "50"],
+                    ["8", "25"],
+                    ["9", "12.5"],
+                    ["10", "7.5"],
+                    ["11-12", "5"],
+                    ["13-14", "2"],
+                    ["15-16", "1"],
+                    ["17-20", "0.5"],
+                    ["21-25", "0.5"],
+                    ["26-27", "1"],
+                    ["28-29", "2"],
+                    ["30-31", "5"],
+                    ["32", "7.5"],
+                    ["33", "12.5"],
+                    ["34", "25"],
+                    ["35", "50"],
+                    ["36", "100"]
+                ];
+                rows.forEach(r => {
+                    const tr = document.createElement("tr");
+                    tr.innerHTML = `<td>${r[0]}</td><td>${r[1]}</td>`;
+                    tbody.appendChild(tr);
+                });
+            })();
+
+            // Main verification: compute sha256(serverSeedPlain) and generate dice
+            async function verifyAndGenerate(serverSeedInput, serverSeedHashInput, clientSeed, nonce) {
+                // serverSeedInput may be hex or text
+                let serverSeedBytes;
+                let serverSeedRepresentation;
+                if (serverSeedInput.trim() === "") throw new Error("Server seed kosong");
+                if (isHex(serverSeedInput.replace(/^0x/i, ''))) {
+                    // assume hex
+                    serverSeedBytes = hexToBytes(serverSeedInput.replace(/^0x/i, ''));
+                    serverSeedRepresentation = "hex";
+                } else {
+                    serverSeedBytes = utf8ToBytes(serverSeedInput);
+                    serverSeedRepresentation = "utf8";
+                }
+
+                // compute sha256
+                const computedHash = await sha256Hex(serverSeedBytes.buffer);
+                const hashMatch = (computedHash.toLowerCase() === serverSeedHashInput.replace(/^0x/i, '').toLowerCase());
+
+                // prepare HMAC key bytes = serverSeedBytes
+                // We'll use HMAC(server_seed_plain, message) where message = `${clientSeed}:${nonce}:${dieIndex}:${counter}`
+                const prfDetails = [];
+                const dice = [];
+                for (let dieIndex = 0; dieIndex < 6; dieIndex++) {
+                    let counter = 0;
+                    let accepted = false;
+                    while (!accepted) {
+                        const msg = `${clientSeed}:${nonce}:${dieIndex}:${counter}`;
+                        const msgBytes = utf8ToBytes(msg);
+                        const prf = await hmacSha256Raw(serverSeedBytes, msgBytes); // Uint8Array(32)
+                        const fair = fairDieFromPrf(prf);
+                        prfDetails.push({
+                            dieIndex, counter, prfHex: bytesToHex(prf.buffer), fair: fair ? { die: fair.die, chunkUsed: fair.chunkUsed, u32: fair.u32 } : null
+                        });
+                        if (fair) {
+                            dice.push(fair.die);
+                            accepted = true;
+                        } else {
+                            counter++;
+                            // continue to get fresh PRF (which is HMAC with counter incremented)
+                        }
+                    }
+                }
+
+                const total = dice.reduce((a, b) => a + b, 0);
+                const multiplier = getMultiplier(total);
+
+                return {
+                    serverSeedRepresentation,
+                    computedHash,
+                    hashMatch,
+                    dice,
+                    total,
+                    multiplier,
+                    prfDetails
+                };
+            }
+
+            // UI wiring
+            const btn = document.getElementById("verifyBtn");
+            const summaryDiv = document.getElementById("summary");
+            const resultArea = document.getElementById("resultArea");
+            const prfDetailsDiv = document.getElementById("prfDetails");
+
+            btn.addEventListener("click", async () => {
+                summaryDiv.innerHTML = "";
+                resultArea.innerHTML = "";
+                prfDetailsDiv.innerHTML = "";
+                try {
+                    btn.disabled = true;
+                    btn.textContent = "Verifying...";
+                    const serverSeed = document.getElementById("serverSeed").value.trim();
+                    const serverSeedHash = document.getElementById("serverSeedHash").value.trim();
+                    const clientSeed = document.getElementById("clientSeed").value.trim();
+                    const nonce = parseInt(document.getElementById("nonce").value || "0", 10);
+
+                    if (!serverSeed || !serverSeedHash) throw new Error("Server seed & server seed hash wajib diisi.");
+
+                    const res = await verifyAndGenerate(serverSeed, serverSeedHash, clientSeed, nonce);
+
+                    // Summary
+                    summaryDiv.innerHTML = `
+        <div><strong>Server seed input type:</strong> ${res.serverSeedRepresentation}</div>
+        <div><strong>SHA-256(server_seed_plain):</strong> <code>${res.computedHash}</code></div>
+        <div><strong>Provided server seed hash:</strong> <code>${serverSeedHash}</code></div>
+        <div><strong>Hash match:</strong> ${res.hashMatch ? '<span class="ok">YA</span>' : '<span class="bad">TIDAK</span>'}</div>
+        <div style="margin-top:6px;"><strong>Client seed:</strong> ${clientSeed} &nbsp; <strong>Nonce:</strong> ${nonce}</div>
+      `;
+
+                    // Result area
+                    resultArea.innerHTML = `
+        <div><strong>Dice:</strong> ${res.dice.join(", ")}</div>
+        <div><strong>Total:</strong> ${res.total}</div>
+        <div><strong>Multiplier:</strong> x${res.multiplier}</div>
+      `;
+
+                    // PRF details table
+                    const table = document.createElement("table");
+                    table.innerHTML = `<thead><tr><th>Die</th><th>Counter</th><th>PRF (HMAC hex)</th><th>ChunkUsed</th><th>u32</th><th>DieValue</th></tr></thead>`;
+                    const tb = document.createElement("tbody");
+                    res.prfDetails.forEach(d => {
+                        const tr = document.createElement("tr");
+                        tr.innerHTML = `<td>${d.dieIndex}</td><td>${d.counter}</td><td style="font-family:monospace; font-size:12px; max-width:420px; overflow:auto;">${d.prfHex}</td><td>${d.fair ? d.fair.chunkUsed : '-'}</td><td>${d.fair ? d.fair.u32 : '-'}</td><td>${d.fair ? d.fair.die : '-'}</td>`;
+                        tb.appendChild(tr);
+                    });
+                    table.appendChild(tb);
+                    prfDetailsDiv.appendChild(table);
+
+                } catch (err) {
+                    summaryDiv.innerHTML = `<div class="bad">Error: ${err.message}</div>`;
+                } finally {
+                    btn.disabled = false;
+                    btn.textContent = "Verifikasi & Generate 6 dadu";
+                }
+            });
+
+        })();
+    </script>
+</body>
+
+</html>
